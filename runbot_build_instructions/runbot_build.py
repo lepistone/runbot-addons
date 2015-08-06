@@ -24,10 +24,11 @@ import logging
 import os
 import sys
 import shutil
+import time
 
 import openerp
 from openerp.osv import orm, fields
-from openerp.addons.runbot.runbot import mkdirs
+from openerp.addons.runbot.runbot import mkdirs, now
 
 _logger = logging.getLogger(__name__)
 
@@ -61,13 +62,74 @@ class runbot_build(orm.Model):
     }
 
     def job_00_init(self, cr, uid, build, lock_path, log_path):
+        _logger.info('starting job_00_init')
         res = super(runbot_build, self).job_00_init(
             cr, uid, build, lock_path, log_path
         )
         if build.branch_id.repo_id.is_custom_build:
+            _logger.info('starting prebuild')
             build.pre_build(lock_path, log_path)
         build.prebuilt = True
         return res
+
+    def job_10_test_base(self, cr, uid, build, lock_path, log_path):
+        if build.branch_id.repo_id.is_custom_build:
+            _logger.info('skipping test_base')
+            return -2
+        else:
+            return super(runbot_build, self).job_10_test_base(
+                cr, uid, build, lock_path, log_path
+            )
+
+    def job_20_test_all(self, cr, uid, build, lock_path, log_path):
+        if build.branch_id.repo_id.is_custom_build:
+            _logger.info('starting test_all')
+            build._log('test_all', 'Start custom setup')
+            build.write({'job_start': now()})
+            cmd = [
+                build.path('bin/oerpscenario'), '-t', 'mid',
+                '-t', 'setup', '--stop'
+            ]
+            build.write({'job_start': now()})
+
+            pushd = os.getcwd()
+            try:
+                os.chdir(build.path())
+                pid = self.spawn(cmd, lock_path, log_path, cpu_limit=2100)
+            finally:
+                os.chdir(pushd)
+            return pid
+        else:
+            return super(runbot_build, self).job_20_test_all(
+                cr, uid, build, lock_path, log_path
+            )
+
+    def job_30_run(self, cr, uid, build, lock_path, log_path):
+        if build.branch_id.repo_id.is_custom_build:
+            build._log('run', 'Start running build %s' % build.dest)
+            log_all = build.path('logs', 'job_20_test_all.txt')
+            log_time = time.localtime(os.path.getmtime(log_all))
+            v = {
+                'job_end': time.strftime(
+                    openerp.tools.DEFAULT_SERVER_DATETIME_FORMAT, log_time),
+            }
+            v['result'] = "of"  # TODO actually the result
+            build.write(v)
+            # build.github_status()
+
+            # run server
+            cmd, mods = build.cmd()  # XXX
+            if os.path.exists(build.server('addons/im_livechat')):
+                cmd += ["--longpolling-port", "%d" % (build.port + 1)]
+                cmd += ["--max-cron-threads", "1"]
+            else:
+                # not sure, to avoid old server to check other dbs
+                cmd += ["--max-cron-threads", "0"]
+
+            cmd += ['-d', "%s-all" % build.dest]
+
+            cmd += ['--db_maxconn', '8']
+        return self.spawn(cmd, lock_path, log_path, cpu_limit=None)
 
     def sub_cmd(self, build, cmd):
         if not cmd:
@@ -78,6 +140,7 @@ class runbot_build(orm.Model):
             'custom_build_dir': build.repo_id.custom_build_dir or '',
             'custom_server_path': build.repo_id.custom_server_path,
             'other_repo_path': build.repo_id.other_repo_id.path or '',
+            'build_dest': build.dest,
         }
         return [i % internal_vals for i in cmd]
 
